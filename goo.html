@@ -11,21 +11,21 @@
 <script>
 // ------------------ Tunables ------------------
 const WIDTH = window.innerWidth, HEIGHT = window.innerHeight;
-const GRAVITY = { x: 0, y: 175 };
-const DAMPING = 0.995;
-const SOLVER_ITER = 3;
-const STIFFNESS = 0.15;
-const LINK_SLACK = 1.05;
-const NODE_R = 8;
-const CURSOR_R = 10;
-const WALL_RESTITUTION = 0.25;
-const MAX_DT = 1/30;
+const GRAVITY = { x: 0, y: 175 };          // Force pulling nodes downward (higher = faster falling)
+const DAMPING = 0.995;                     // Velocity decay per frame (lower = more air resistance)
+const SOLVER_ITER = 6;                     // Constraint iterations per frame (higher = more rigid but slower)
+const STIFFNESS = 0.65;                    // Link constraint strength (higher = less stretchy connections)
+const LINK_SLACK = 1.05;                   // Link rest length multiplier (higher = more stretchy at rest)
+const NODE_R = 8;                          // Node radius for rendering and collision
+const CURSOR_R = 10;                       // Cursor radius for rendering
+const WALL_RESTITUTION = 0.25;             // Bounce factor for wall collisions (0=sticky, 1=perfect bounce)
+const MAX_DT = 1/30;                       // Maximum timestep to prevent instability
 
 // Ground
-const GROUND_Y = HEIGHT - 90;  // top of white ground
-const GROUND_H = 120;          // thickness (visual)
-const RESTITUTION = 0.18;
-const FRICTION = 0.85;
+const GROUND_Y = HEIGHT - 90;              // Y position of ground surface
+const GROUND_H = 120;                      // Ground thickness for visual rendering
+const RESTITUTION = 0.18;                  // Ground bounce factor (0=no bounce, 1=perfect bounce)
+const FRICTION = 0.85;                     // Ground friction (0=ice, 1=sticky)
 
 // ------------------ PIXI ------------------
 const app = new PIXI.Application({ width: WIDTH, height: HEIGHT, backgroundAlpha: 0, antialias: true });
@@ -72,7 +72,7 @@ class Link {
   constructor(a, b, stiffness = STIFFNESS) {
     this.a = a; this.b = b;
     const dx = b.x - a.x, dy = b.y - a.y;
-    this.rest = Math.hypot(dx, dy) * LINK_SLACK;
+    this.rest = Math.hypot(dx, dy) ;
     this.stiffness = stiffness;
   }
   satisfy() {
@@ -128,12 +128,64 @@ cursor.isCursor = true;
 
 // Input state
 let mouse = { x: cursor.x, y: cursor.y };
+let isDeleteMode = false;
+let hoveredNode = null;
 
 // ------------------ Helpers ------------------
 function nearestK(target, pool, k=2) {
   const arr = pool.map(n => ({ n, d2: (n.x-target.x)**2 + (n.y-target.y)**2 }))
                  .sort((a,b) => a.d2 - b.d2);
   return arr.slice(0,k).map(o => o.n);
+}
+
+function getClickedNode(mouseX, mouseY) {
+  for (const node of nodes) {
+    const dx = node.x - mouseX;
+    const dy = node.y - mouseY;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    if (distance <= node.r) {
+      return node;
+    }
+  }
+  return null;
+}
+
+function removeNode(nodeToRemove) {
+  // Find nodes that will become orphaned after removing this node
+  const connectedNodes = [];
+  for (const link of links) {
+    if (link.a === nodeToRemove) {
+      connectedNodes.push(link.b);
+    } else if (link.b === nodeToRemove) {
+      connectedNodes.push(link.a);
+    }
+  }
+
+  // Remove all links connected to this node
+  for (let i = links.length - 1; i >= 0; i--) {
+    const link = links[i];
+    if (link.a === nodeToRemove || link.b === nodeToRemove) {
+      links.splice(i, 1);
+    }
+  }
+
+  // Remove the node itself
+  const nodeIndex = nodes.indexOf(nodeToRemove);
+  if (nodeIndex !== -1) {
+    nodes.splice(nodeIndex, 1);
+  }
+
+  // Check if any connected nodes now have insufficient connections and remove them
+  for (const connectedNode of connectedNodes) {
+    const connectionCount = links.filter(link =>
+      link.a === connectedNode || link.b === connectedNode
+    ).length;
+
+    // If node has less than 2 connections, remove it recursively
+    if (connectionCount < 2) {
+      removeNode(connectedNode);
+    }
+  }
 }
 
 function lineIntersection(p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y) {
@@ -186,39 +238,54 @@ function preventLinkCrossings() {
       );
 
       if (intersection) {
-        // Push nodes apart to prevent crossing
-        const pushStrength = 1.0;
         const ix = intersection.x;
         const iy = intersection.y;
 
-        // Push link1 nodes away from intersection
-        const dx1a = link1.a.x - ix;
-        const dy1a = link1.a.y - iy;
-        const dx1b = link1.b.x - ix;
-        const dy1b = link1.b.y - iy;
+        // Only apply force if intersection is not too close to any node
+        const minDistToNode = Math.min(
+          Math.hypot(link1.a.x - ix, link1.a.y - iy),
+          Math.hypot(link1.b.x - ix, link1.b.y - iy),
+          Math.hypot(link2.a.x - ix, link2.a.y - iy),
+          Math.hypot(link2.b.x - ix, link2.b.y - iy)
+        );
 
-        if (!link1.a.pinned) {
-          link1.a.x += dx1a > 0 ? pushStrength : -pushStrength;
-          link1.a.y += dy1a > 0 ? pushStrength : -pushStrength;
-        }
-        if (!link1.b.pinned) {
-          link1.b.x += dx1b > 0 ? pushStrength : -pushStrength;
-          link1.b.y += dy1b > 0 ? pushStrength : -pushStrength;
-        }
+        if (minDistToNode > NODE_R) {
+          // Push nodes apart to prevent crossing - gentler force
+          const pushStrength = 0.3;
 
-        // Push link2 nodes away from intersection
-        const dx2a = link2.a.x - ix;
-        const dy2a = link2.a.y - iy;
-        const dx2b = link2.b.x - ix;
-        const dy2b = link2.b.y - iy;
+          // Push link1 nodes away from intersection
+          const dx1a = link1.a.x - ix;
+          const dy1a = link1.a.y - iy;
+          const dx1b = link1.b.x - ix;
+          const dy1b = link1.b.y - iy;
+          const dist1a = Math.hypot(dx1a, dy1a) || 1e-6;
+          const dist1b = Math.hypot(dx1b, dy1b) || 1e-6;
 
-        if (!link2.a.pinned) {
-          link2.a.x += dx2a > 0 ? pushStrength : -pushStrength;
-          link2.a.y += dy2a > 0 ? pushStrength : -pushStrength;
-        }
-        if (!link2.b.pinned) {
-          link2.b.x += dx2b > 0 ? pushStrength : -pushStrength;
-          link2.b.y += dy2b > 0 ? pushStrength : -pushStrength;
+          if (!link1.a.pinned) {
+            link1.a.x += (dx1a / dist1a) * pushStrength;
+            link1.a.y += (dy1a / dist1a) * pushStrength;
+          }
+          if (!link1.b.pinned) {
+            link1.b.x += (dx1b / dist1b) * pushStrength;
+            link1.b.y += (dy1b / dist1b) * pushStrength;
+          }
+
+          // Push link2 nodes away from intersection
+          const dx2a = link2.a.x - ix;
+          const dy2a = link2.a.y - iy;
+          const dx2b = link2.b.x - ix;
+          const dy2b = link2.b.y - iy;
+          const dist2a = Math.hypot(dx2a, dy2a) || 1e-6;
+          const dist2b = Math.hypot(dx2b, dy2b) || 1e-6;
+
+          if (!link2.a.pinned) {
+            link2.a.x += (dx2a / dist2a) * pushStrength;
+            link2.a.y += (dy2a / dist2a) * pushStrength;
+          }
+          if (!link2.b.pinned) {
+            link2.b.x += (dx2b / dist2b) * pushStrength;
+            link2.b.y += (dy2b / dist2b) * pushStrength;
+          }
         }
       }
     }
@@ -311,6 +378,10 @@ app.ticker.add(() => {
   const dt = 1/60; // Fixed timestep
   lastT = now;
 
+  // Update cursor mode based on proximity to nodes
+  hoveredNode = getClickedNode(mouse.x, mouse.y);
+  isDeleteMode = hoveredNode !== null;
+
   // Cursor follows mouse (no physics)
   cursor.x = mouse.x; cursor.y = mouse.y;
   cursor.px = cursor.x; cursor.py = cursor.y;
@@ -353,43 +424,57 @@ function render() {
 
   // ghost preview
   ghostLayer.clear();
-  const near = nearestK(cursor, nodes, 2);
-  if (near.length === 2) {
-    // Check if either connection would cross existing links
-    const canConnect1 = !wouldLinkCross(cursor, near[0]);
-    const canConnect2 = !wouldLinkCross(cursor, near[1]);
 
-    if (canConnect1 || canConnect2) {
-      if (canConnect1 && canConnect2) {
-        // Both connections are valid - show in blue
-        ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
-        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
-        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
-      } else if (canConnect1) {
-        // Only first connection is valid
-        ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
-        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
-        ghostLayer.lineStyle(4, 0xff6666, 0.55);
-        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
+  if (isDeleteMode && hoveredNode) {
+    // Delete mode - highlight the hovered node in red
+    ghostLayer.lineStyle(3, 0xff4444, 1.0);
+    ghostLayer.beginFill(0xff4444, 0.3);
+    ghostLayer.drawCircle(hoveredNode.x, hoveredNode.y, hoveredNode.r + 3);
+    ghostLayer.endFill();
+  } else {
+    // Add mode - show connection preview
+    const near = nearestK(cursor, nodes, 2);
+    if (near.length === 2) {
+      // Check if either connection would cross existing links
+      const canConnect1 = !wouldLinkCross(cursor, near[0]);
+      const canConnect2 = !wouldLinkCross(cursor, near[1]);
+
+      if (canConnect1 || canConnect2) {
+        if (canConnect1 && canConnect2) {
+          // Both connections are valid - show in blue
+          ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
+          ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
+          ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
+        } else if (canConnect1) {
+          // Only first connection is valid
+          ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
+          ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
+          ghostLayer.lineStyle(4, 0xff6666, 0.55);
+          ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
+        } else {
+          // Only second connection is valid
+          ghostLayer.lineStyle(4, 0xff6666, 0.55);
+          ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
+          ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
+          ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
+        }
       } else {
-        // Only second connection is valid
+        // Neither connection is valid - show in red
         ghostLayer.lineStyle(4, 0xff6666, 0.55);
         ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
-        ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
         ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
       }
-    } else {
-      // Neither connection is valid - show in red
-      ghostLayer.lineStyle(4, 0xff6666, 0.55);
-      ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
-      ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
     }
   }
 
   // nodes
   nodeLayer.clear();
   for (const n of nodes) { nodeLayer.beginFill(0xdde7ff, 1); nodeLayer.drawCircle(n.x, n.y, n.r); nodeLayer.endFill(); }
-  nodeLayer.beginFill(0xffffff, 1); nodeLayer.drawCircle(cursor.x, cursor.y, cursor.r); nodeLayer.endFill();
+
+  // Only show cursor in add mode
+  if (!isDeleteMode) {
+    nodeLayer.beginFill(0xffffff, 1); nodeLayer.drawCircle(cursor.x, cursor.y, cursor.r); nodeLayer.endFill();
+  }
 
   // HUD
   nodeLayer.lineStyle(0);
@@ -409,9 +494,16 @@ app.view.addEventListener('pointermove', (e) => {
   mouse.x = (e.clientX - rect.left) * (app.renderer.width / rect.width);
   mouse.y = (e.clientY - rect.top) * (app.renderer.height / rect.height);
 });
-app.view.addEventListener('pointerdown', commitCursorLinks);
+app.view.addEventListener('pointerdown', handleClick);
 
-function commitCursorLinks() {
+function handleClick() {
+  if (isDeleteMode && hoveredNode) {
+    // Delete mode - remove the hovered node
+    removeNode(hoveredNode);
+    return;
+  }
+
+  // Add mode - try to add a new node
   const near = nearestK(cursor, nodes, 2);
   if (near.length < 2) return;
 
@@ -423,6 +515,7 @@ function commitCursorLinks() {
   if (!canConnect1 || !canConnect2) return;
 
   cursor.px = cursor.x; cursor.py = cursor.y;
+  cursor.py = cursor.y - 3; // Give initial downward velocity
   nodes.push(cursor);
 
   // Create both links
