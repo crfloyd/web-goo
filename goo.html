@@ -11,10 +11,10 @@
 <script>
 // ------------------ Tunables ------------------
 const WIDTH = window.innerWidth, HEIGHT = window.innerHeight;
-const GRAVITY = { x: 0, y: 3.5 };
+const GRAVITY = { x: 0, y: 15 };
 const DAMPING = 0.995;
-const SOLVER_ITER = 8;
-const STIFFNESS = 0.35;
+const SOLVER_ITER = 3;
+const STIFFNESS = 0.15;
 const LINK_SLACK = 1.05;
 const NODE_R = 8;
 const CURSOR_R = 10;
@@ -39,7 +39,7 @@ app.stage.addChild(groundLayer, linkLayer, ghostLayer, nodeLayer);
 
 // ------------------ Physics ------------------
 class Node {
-  constructor(x, y, r = NODE_R, mass = 1, pinned = false) {
+  constructor(x, y, r = NODE_R, mass = 5, pinned = false) {
     this.x = x; this.y = y;
     this.px = x; this.py = y;
     this.ax = 0; this.ay = 0;
@@ -51,9 +51,14 @@ class Node {
     if (this.pinned) { this.px = this.x; this.py = this.y; this.ax = this.ay = 0; return; }
     let vx = (this.x - this.px) * DAMPING;
     let vy = (this.y - this.py) * DAMPING;
-    this.px = this.x; this.py = this.y;
-    this.x += vx + this.ax * dt * dt;
-    this.y += vy + this.ay * dt * dt;
+
+    let newX = this.x + vx + this.ax * dt * dt;
+    let newY = this.y + vy + this.ay * dt * dt;
+
+    this.px = this.x;
+    this.py = this.y;
+    this.x = newX;
+    this.y = newY;
     this.ax = 0; this.ay = 0;
   }
   boundsNoFloor() {
@@ -118,7 +123,7 @@ function spawnTriangleTouchingGround(cx, size = 70) {
 spawnTriangleTouchingGround(WIDTH * 0.5, 70);
 
 // Cursor (non-physical until committed)
-let cursor = new Node(WIDTH*0.7, HEIGHT*0.2, CURSOR_R, 1, false);
+let cursor = new Node(WIDTH*0.7, HEIGHT*0.2, CURSOR_R, 5, false);
 cursor.isCursor = true;
 
 // Input state
@@ -260,7 +265,7 @@ function applyRotationalForces() {
     }
 
     // Apply stronger tipping force
-    const tippingStrength = 0.03;
+    const tippingStrength = 0.08;
 
     // Apply tipping force to all nodes
     for (const n of nodes) {
@@ -278,7 +283,7 @@ function collideNodeWithGround(n) {
   const pen = n.y - (top - n.r);
 
   if (pen > 0) {
-    // Full position correction to prevent sinking
+    // Position correction to prevent sinking
     n.y = top - n.r;
 
     // Get velocity from verlet integration
@@ -295,10 +300,6 @@ function collideNodeWithGround(n) {
       n.px = n.x - vtAfter;
       n.py = n.y - vnAfter;
     }
-  } else if (pen > -10) {
-    // Apply attractive force when close to ground to help settling
-    const attractForce = (10 + pen) * 0.05;
-    n.applyForce(0, attractForce);
   }
 }
 
@@ -306,7 +307,8 @@ function collideNodeWithGround(n) {
 let lastT = performance.now();
 app.ticker.add(() => {
   const now = performance.now();
-  const dt = Math.min((now - lastT)/1000, MAX_DT);
+  // const dt = Math.min((now - lastT)/1000, MAX_DT);
+  const dt = 1/60; // Fixed timestep
   lastT = now;
 
   // Cursor follows mouse (no physics)
@@ -317,9 +319,9 @@ app.ticker.add(() => {
   for (const n of nodes) n.applyForce(GRAVITY.x * n.mass, GRAVITY.y * n.mass);
 
   // Rotational physics based on weight distribution
-  if (nodes.length > 0) {
-    applyRotationalForces();
-  }
+//   if (nodes.length > 0) {
+//     applyRotationalForces();
+//   }
 
   // Integrate
   for (const n of nodes) n.integrate(dt);
@@ -426,7 +428,7 @@ function commitCursorLinks() {
   links.push(new Link(cursor, near[0], STIFFNESS));
   links.push(new Link(cursor, near[1], STIFFNESS));
 
-  cursor = new Node(mouse.x, mouse.y, CURSOR_R, 1, false);
+  cursor = new Node(mouse.x, mouse.y, CURSOR_R, 5, false);
   cursor.isCursor = true;
   cursor.px = cursor.x; cursor.py = cursor.y;
 }
