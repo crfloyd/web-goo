@@ -187,7 +187,7 @@ function preventLinkCrossings() {
 
       if (intersection) {
         // Push nodes apart to prevent crossing
-        const pushStrength = 2.0;
+        const pushStrength = 1.0;
         const ix = intersection.x;
         const iy = intersection.y;
 
@@ -332,6 +332,7 @@ app.ticker.add(() => {
     for (const n of nodes) collideNodeWithGround(n);
     preventLinkCrossings();
     for (const l of links) l.satisfy();
+    preventLinkCrossings(); // Run again after constraints
   }
 
   render();
