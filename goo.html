@@ -11,7 +11,7 @@
 <script>
 // ------------------ Tunables ------------------
 const WIDTH = window.innerWidth, HEIGHT = window.innerHeight;
-const GRAVITY = { x: 0, y: 15 };
+const GRAVITY = { x: 0, y: 175 };
 const DAMPING = 0.995;
 const SOLVER_ITER = 3;
 const STIFFNESS = 0.15;
@@ -39,7 +39,7 @@ app.stage.addChild(groundLayer, linkLayer, ghostLayer, nodeLayer);
 
 // ------------------ Physics ------------------
 class Node {
-  constructor(x, y, r = NODE_R, mass = 5, pinned = false) {
+  constructor(x, y, r = NODE_R, mass = 15, pinned = false) {
     this.x = x; this.y = y;
     this.px = x; this.py = y;
     this.ax = 0; this.ay = 0;
@@ -123,7 +123,7 @@ function spawnTriangleTouchingGround(cx, size = 70) {
 spawnTriangleTouchingGround(WIDTH * 0.5, 70);
 
 // Cursor (non-physical until committed)
-let cursor = new Node(WIDTH*0.7, HEIGHT*0.2, CURSOR_R, 5, false);
+let cursor = new Node(WIDTH*0.7, HEIGHT*0.2, CURSOR_R, 15, false);
 cursor.isCursor = true;
 
 // Input state
@@ -265,7 +265,7 @@ function applyRotationalForces() {
     }
 
     // Apply stronger tipping force
-    const tippingStrength = 0.08;
+    const tippingStrength = 0.2;
 
     // Apply tipping force to all nodes
     for (const n of nodes) {
@@ -429,7 +429,7 @@ function commitCursorLinks() {
   links.push(new Link(cursor, near[0], STIFFNESS));
   links.push(new Link(cursor, near[1], STIFFNESS));
 
-  cursor = new Node(mouse.x, mouse.y, CURSOR_R, 5, false);
+  cursor = new Node(mouse.x, mouse.y, CURSOR_R, 15, false);
   cursor.isCursor = true;
   cursor.px = cursor.x; cursor.py = cursor.y;
 }
