@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Goo Mesh – Solid Ground Contact</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>html,body{margin:0;height:100%;background:#0f1020;overflow:hidden;font-family:system-ui,Segoe UI,Roboto,sans-serif}</style>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@7.4.0/dist/pixi.min.js"></script>
+</head>
+<body>
+<script>
+// ------------------ Tunables ------------------
+const WIDTH = window.innerWidth, HEIGHT = window.innerHeight;
+const GRAVITY = { x: 0, y: 3.5 };
+const DAMPING = 0.995;
+const SOLVER_ITER = 8;
+const STIFFNESS = 0.35;
+const LINK_SLACK = 1.05;
+const NODE_R = 8;
+const CURSOR_R = 10;
+const WALL_RESTITUTION = 0.25;
+const MAX_DT = 1/30;
+
+// Ground
+const GROUND_Y = HEIGHT - 90;  // top of white ground
+const GROUND_H = 120;          // thickness (visual)
+const RESTITUTION = 0.18;
+const FRICTION = 0.85;
+
+// ------------------ PIXI ------------------
+const app = new PIXI.Application({ width: WIDTH, height: HEIGHT, backgroundAlpha: 0, antialias: true });
+document.body.appendChild(app.view);
+
+const groundLayer = new PIXI.Graphics();
+const linkLayer   = new PIXI.Graphics();
+const ghostLayer  = new PIXI.Graphics();
+const nodeLayer   = new PIXI.Graphics();
+app.stage.addChild(groundLayer, linkLayer, ghostLayer, nodeLayer);
+
+// ------------------ Physics ------------------
+class Node {
+  constructor(x, y, r = NODE_R, mass = 1, pinned = false) {
+    this.x = x; this.y = y;
+    this.px = x; this.py = y;
+    this.ax = 0; this.ay = 0;
+    this.r = r; this.mass = mass;
+    this.pinned = pinned;
+  }
+  applyForce(fx, fy) { this.ax += fx / this.mass; this.ay += fy / this.mass; }
+  integrate(dt) {
+    if (this.pinned) { this.px = this.x; this.py = this.y; this.ax = this.ay = 0; return; }
+    let vx = (this.x - this.px) * DAMPING;
+    let vy = (this.y - this.py) * DAMPING;
+    this.px = this.x; this.py = this.y;
+    this.x += vx + this.ax * dt * dt;
+    this.y += vy + this.ay * dt * dt;
+    this.ax = 0; this.ay = 0;
+  }
+  boundsNoFloor() {
+    if (this.x < this.r) { this.x = this.r; this.px = this.x + (this.x - this.px) * -WALL_RESTITUTION; }
+    if (this.x > app.renderer.width - this.r) { this.x = app.renderer.width - this.r; this.px = this.x + (this.x - this.px) * -WALL_RESTITUTION; }
+    if (this.y < this.r) { this.y = this.r; this.py = this.y + (this.y - this.py) * -WALL_RESTITUTION; }
+  }
+}
+
+class Link {
+  constructor(a, b, stiffness = STIFFNESS) {
+    this.a = a; this.b = b;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    this.rest = Math.hypot(dx, dy) * LINK_SLACK;
+    this.stiffness = stiffness;
+  }
+  satisfy() {
+    const ax = this.a.x, ay = this.a.y;
+    const bx = this.b.x, by = this.b.y;
+    let dx = bx - ax, dy = by - ay;
+    let d = Math.hypot(dx, dy) || 1e-6;
+    const diff = (d - this.rest) / d;
+
+
+    const factor = 0.5 * this.stiffness;
+    const ox = dx * diff * factor;
+    const oy = dy * diff * factor;
+    if (!this.a.pinned) { this.a.x += ox; this.a.y += oy; }
+    if (!this.b.pinned) { this.b.x -= ox; this.b.y -= oy; }
+  }
+}
+
+const nodes = [];
+const links = [];
+
+// Physics state for rotation
+let meshCenterX = 0, meshCenterY = 0;
+let meshAngularVel = 0;
+const ANGULAR_DAMPING = 0.98;
+const TORQUE_FACTOR = 0.002;
+
+// Triangle that starts above ground and falls
+function spawnTriangleTouchingGround(cx, size = 70) {
+  const startY = HEIGHT * 0.3; // Start well above ground
+  const A = new Node(cx, startY);                     // top
+  const B = new Node(cx - size * 0.9, startY + size); // left base
+  const C = new Node(cx + size * 0.9, startY + size); // right base
+
+  // Give initial downward velocity by setting previous positions higher
+  A.py = A.y - 2;
+  B.py = B.y - 2;
+  C.py = C.y - 2;
+
+  nodes.push(A, B, C);
+  links.push(new Link(A, B));
+  links.push(new Link(B, C));
+  links.push(new Link(C, A));
+  return [A, B, C];
+}
+
+// ------------------ Initial Scene ------------------
+spawnTriangleTouchingGround(WIDTH * 0.5, 70);
+
+// Cursor (non-physical until committed)
+let cursor = new Node(WIDTH*0.7, HEIGHT*0.2, CURSOR_R, 1, false);
+cursor.isCursor = true;
+
+// Input state
+let mouse = { x: cursor.x, y: cursor.y };
+
+// ------------------ Helpers ------------------
+function nearestK(target, pool, k=2) {
+  const arr = pool.map(n => ({ n, d2: (n.x-target.x)**2 + (n.y-target.y)**2 }))
+                 .sort((a,b) => a.d2 - b.d2);
+  return arr.slice(0,k).map(o => o.n);
+}
+
+function lineIntersection(p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y) {
+  const denom = (p1x - p2x) * (p3y - p4y) - (p1y - p2y) * (p3x - p4x);
+  if (Math.abs(denom) < 1e-10) return null; // parallel or coincident
+
+  const t = ((p1x - p3x) * (p3y - p4y) - (p1y - p3y) * (p3x - p4x)) / denom;
+  const u = -((p1x - p2x) * (p1y - p3y) - (p1y - p2y) * (p1x - p3x)) / denom;
+
+  if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+    return {
+      x: p1x + t * (p2x - p1x),
+      y: p1y + t * (p2y - p1y),
+      t: t,
+      u: u
+    };
+  }
+  return null;
+}
+
+function wouldLinkCross(fromNode, toNode) {
+  for (const link of links) {
+    // Skip if the link shares a node with our proposed connection
+    if (link.a === fromNode || link.a === toNode ||
+        link.b === fromNode || link.b === toNode) continue;
+
+    const intersection = lineIntersection(
+      fromNode.x, fromNode.y, toNode.x, toNode.y,
+      link.a.x, link.a.y, link.b.x, link.b.y
+    );
+
+    if (intersection) return true;
+  }
+  return false;
+}
+
+function preventLinkCrossings() {
+  for (let i = 0; i < links.length; i++) {
+    for (let j = i + 1; j < links.length; j++) {
+      const link1 = links[i];
+      const link2 = links[j];
+
+      // Skip if links share a node
+      if (link1.a === link2.a || link1.a === link2.b ||
+          link1.b === link2.a || link1.b === link2.b) continue;
+
+      const intersection = lineIntersection(
+        link1.a.x, link1.a.y, link1.b.x, link1.b.y,
+        link2.a.x, link2.a.y, link2.b.x, link2.b.y
+      );
+
+      if (intersection) {
+        // Push nodes apart to prevent crossing
+        const pushStrength = 2.0;
+        const ix = intersection.x;
+        const iy = intersection.y;
+
+        // Push link1 nodes away from intersection
+        const dx1a = link1.a.x - ix;
+        const dy1a = link1.a.y - iy;
+        const dx1b = link1.b.x - ix;
+        const dy1b = link1.b.y - iy;
+
+        if (!link1.a.pinned) {
+          link1.a.x += dx1a > 0 ? pushStrength : -pushStrength;
+          link1.a.y += dy1a > 0 ? pushStrength : -pushStrength;
+        }
+        if (!link1.b.pinned) {
+          link1.b.x += dx1b > 0 ? pushStrength : -pushStrength;
+          link1.b.y += dy1b > 0 ? pushStrength : -pushStrength;
+        }
+
+        // Push link2 nodes away from intersection
+        const dx2a = link2.a.x - ix;
+        const dy2a = link2.a.y - iy;
+        const dx2b = link2.b.x - ix;
+        const dy2b = link2.b.y - iy;
+
+        if (!link2.a.pinned) {
+          link2.a.x += dx2a > 0 ? pushStrength : -pushStrength;
+          link2.a.y += dy2a > 0 ? pushStrength : -pushStrength;
+        }
+        if (!link2.b.pinned) {
+          link2.b.x += dx2b > 0 ? pushStrength : -pushStrength;
+          link2.b.y += dy2b > 0 ? pushStrength : -pushStrength;
+        }
+      }
+    }
+  }
+}
+
+function calculateCenterOfMass() {
+  if (nodes.length === 0) return;
+  let totalMass = 0;
+  let weightedX = 0;
+  let weightedY = 0;
+
+  for (const n of nodes) {
+    totalMass += n.mass;
+    weightedX += n.x * n.mass;
+    weightedY += n.y * n.mass;
+  }
+
+  meshCenterX = weightedX / totalMass;
+  meshCenterY = weightedY / totalMass;
+}
+
+function applyRotationalForces() {
+  calculateCenterOfMass();
+
+  // Find nodes touching the ground
+  const groundNodes = nodes.filter(n => n.y >= GROUND_Y - n.r - 5);
+
+  if (groundNodes.length > 0) {
+    // Calculate average ground contact point
+    let pivotX = 0;
+    for (const gn of groundNodes) {
+      pivotX += gn.x;
+    }
+    pivotX /= groundNodes.length;
+
+    // Calculate moment (torque) around the pivot point
+    let totalMoment = 0;
+    for (const n of nodes) {
+      if (n.pinned) continue;
+      const leverArm = n.x - pivotX;
+      const weight = GRAVITY.y * n.mass;
+      totalMoment += leverArm * weight;
+    }
+
+    // Apply stronger tipping force
+    const tippingStrength = 0.03;
+
+    // Apply tipping force to all nodes
+    for (const n of nodes) {
+      if (n.pinned) continue;
+      const leverArm = n.x - pivotX;
+      const tippingForce = totalMoment * tippingStrength * 0.1;
+      n.applyForce(tippingForce, 0);
+    }
+  }
+}
+
+function collideNodeWithGround(n) {
+  if (n.pinned) return;
+  const top = GROUND_Y;
+  const pen = n.y - (top - n.r);
+
+  if (pen > 0) {
+    // Full position correction to prevent sinking
+    n.y = top - n.r;
+
+    // Get velocity from verlet integration
+    let vx = n.x - n.px;
+    let vy = n.y - n.py;
+
+    // Apply collision response if moving into ground
+    if (vy > 0) {
+      const vn = vy;   // normal velocity (y)
+      const vt = vx;   // tangent velocity (x)
+      const vnAfter = -vn * RESTITUTION;
+      const vtAfter = vt * FRICTION;
+
+      n.px = n.x - vtAfter;
+      n.py = n.y - vnAfter;
+    }
+  } else if (pen > -10) {
+    // Apply attractive force when close to ground to help settling
+    const attractForce = (10 + pen) * 0.05;
+    n.applyForce(0, attractForce);
+  }
+}
+
+// ------------------ Tick ------------------
+let lastT = performance.now();
+app.ticker.add(() => {
+  const now = performance.now();
+  const dt = Math.min((now - lastT)/1000, MAX_DT);
+  lastT = now;
+
+  // Cursor follows mouse (no physics)
+  cursor.x = mouse.x; cursor.y = mouse.y;
+  cursor.px = cursor.x; cursor.py = cursor.y;
+
+  // Forces
+  for (const n of nodes) n.applyForce(GRAVITY.x * n.mass, GRAVITY.y * n.mass);
+
+  // Rotational physics based on weight distribution
+  if (nodes.length > 0) {
+    applyRotationalForces();
+  }
+
+  // Integrate
+  for (const n of nodes) n.integrate(dt);
+
+  // Constraints + bounds + ground
+  for (let it=0; it<SOLVER_ITER; it++) {
+    for (const n of nodes) n.boundsNoFloor();
+    for (const n of nodes) collideNodeWithGround(n);
+    preventLinkCrossings();
+    for (const l of links) l.satisfy();
+  }
+
+  render();
+});
+
+// ------------------ Render ------------------
+function render() {
+  // solid white ground
+  groundLayer.clear();
+  groundLayer.beginFill(0xffffff, 1);
+  groundLayer.drawRect(0, GROUND_Y, app.renderer.width, GROUND_H);
+  groundLayer.endFill();
+
+  // links
+  linkLayer.clear();
+  linkLayer.lineStyle(6, 0x6aa8ff, 0.26);
+  for (const l of links) { linkLayer.moveTo(l.a.x, l.a.y); linkLayer.lineTo(l.b.x, l.b.y); }
+
+  // ghost preview
+  ghostLayer.clear();
+  const near = nearestK(cursor, nodes, 2);
+  if (near.length === 2) {
+    // Check if either connection would cross existing links
+    const canConnect1 = !wouldLinkCross(cursor, near[0]);
+    const canConnect2 = !wouldLinkCross(cursor, near[1]);
+
+    if (canConnect1 || canConnect2) {
+      if (canConnect1 && canConnect2) {
+        // Both connections are valid - show in blue
+        ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
+        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
+        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
+      } else if (canConnect1) {
+        // Only first connection is valid
+        ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
+        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
+        ghostLayer.lineStyle(4, 0xff6666, 0.55);
+        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
+      } else {
+        // Only second connection is valid
+        ghostLayer.lineStyle(4, 0xff6666, 0.55);
+        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
+        ghostLayer.lineStyle(4, 0x9bd1ff, 0.55);
+        ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
+      }
+    } else {
+      // Neither connection is valid - show in red
+      ghostLayer.lineStyle(4, 0xff6666, 0.55);
+      ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[0].x, near[0].y);
+      ghostLayer.moveTo(cursor.x, cursor.y); ghostLayer.lineTo(near[1].x, near[1].y);
+    }
+  }
+
+  // nodes
+  nodeLayer.clear();
+  for (const n of nodes) { nodeLayer.beginFill(0xdde7ff, 1); nodeLayer.drawCircle(n.x, n.y, n.r); nodeLayer.endFill(); }
+  nodeLayer.beginFill(0xffffff, 1); nodeLayer.drawCircle(cursor.x, cursor.y, cursor.r); nodeLayer.endFill();
+
+  // HUD
+  nodeLayer.lineStyle(0);
+  nodeLayer.beginFill(0x12142d, 1);
+  nodeLayer.drawRect(0, app.renderer.height-40, app.renderer.width, 40);
+  nodeLayer.endFill();
+  drawText("Solid white ground; triangle base starts in contact. Click to add a node connected to its 2 nearest.", 12, app.renderer.height-18);
+}
+
+const hudStyle = new PIXI.TextStyle({ fill: 0xbfc8ff, fontSize: 13 });
+const hudText = new PIXI.Text("", hudStyle); hudText.alpha = 0.9; app.stage.addChild(hudText);
+function drawText(s, x, y) { hudText.text = s; hudText.position.set(x, y); }
+
+// ------------------ Input ------------------
+app.view.addEventListener('pointermove', (e) => {
+  const rect = app.view.getBoundingClientRect();
+  mouse.x = (e.clientX - rect.left) * (app.renderer.width / rect.width);
+  mouse.y = (e.clientY - rect.top) * (app.renderer.height / rect.height);
+});
+app.view.addEventListener('pointerdown', commitCursorLinks);
+
+function commitCursorLinks() {
+  const near = nearestK(cursor, nodes, 2);
+  if (near.length < 2) return;
+
+  // Check which connections are valid (don't cross existing links)
+  const canConnect1 = !wouldLinkCross(cursor, near[0]);
+  const canConnect2 = !wouldLinkCross(cursor, near[1]);
+
+  // Only commit if BOTH connections are valid (need at least 2 connections)
+  if (!canConnect1 || !canConnect2) return;
+
+  cursor.px = cursor.x; cursor.py = cursor.y;
+  nodes.push(cursor);
+
+  // Create both links
+  links.push(new Link(cursor, near[0], STIFFNESS));
+  links.push(new Link(cursor, near[1], STIFFNESS));
+
+  cursor = new Node(mouse.x, mouse.y, CURSOR_R, 1, false);
+  cursor.isCursor = true;
+  cursor.px = cursor.x; cursor.py = cursor.y;
+}
+
+// ------------------ Resize ------------------
+window.addEventListener('resize', () => {
+  app.renderer.resize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
